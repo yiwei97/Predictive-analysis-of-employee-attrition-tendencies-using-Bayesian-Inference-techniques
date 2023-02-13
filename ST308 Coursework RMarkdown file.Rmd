@@ -1,0 +1,361 @@
+---
+title: "ST308 Coursework"
+date: "4/3/2021"
+output: html_document
+---
+
+Load packages and data
+```{r}
+rm(list=ls())
+library(rstan)
+library(bayesplot)
+library(data.table)
+library(glmnet)
+library(MASS)
+library(dplyr)
+library(PerformanceAnalytics)
+library(stargazer)
+hrdata = read.csv('Input/hr.csv',header=TRUE)
+#Data from https://www.kaggle.com/vjchoudhary7/hr-analytics-case-study?select=general_data.csv
+```
+
+Subsetting data of interest
+```{r}
+#We are interested in predicting new careers at the company, who ar young to mid career professionals
+hrdata <- hrdata[hrdata$Age < 40,] #Limit to young to mid career professionals
+hrdata <- hrdata[hrdata$YearsAtCompany<=5,] #YearsAtCompany <= 5 for new hires
+
+#Create new column: AgeGroup, containing 2 ages per group
+setDT(hrdata)
+hrdata[Age >17 & Age <20, AgeGroup := 1]
+hrdata[Age >19 & Age <22, AgeGroup := 2]
+hrdata[Age >21 & Age <24, AgeGroup := 3]
+hrdata[Age >23 & Age <26, AgeGroup := 4]
+hrdata[Age >25 & Age <28, AgeGroup := 5]
+hrdata[Age >27 & Age <30, AgeGroup := 6]
+hrdata[Age >29 & Age <32, AgeGroup := 7]
+hrdata[Age >31 & Age <34, AgeGroup := 8]
+hrdata[Age >33 & Age <36, AgeGroup := 9]
+hrdata[Age >35 & Age <38, AgeGroup := 10]
+hrdata[Age >37 & Age <40, AgeGroup := 11]
+
+
+#Selecting categories of interest
+hrdata <- subset(hrdata, select=c("JobRole", "AgeGroup","Attrition",
+                                  "PercentSalaryHike", "StockOptionLevel",
+                                  "YearsSinceLastPromotion","BusinessTravel",
+                                  "MonthlyIncome", "TrainingTimesLastYear",
+                                  "DistanceFromHome"))
+```
+
+Data cleaning
+```{r}
+#Check for missing values
+any(is.na(hrdata)) #FALSE
+
+#Remove outliers
+hist(hrdata$MonthlyIncome)
+summary(hrdata$MonthlyIncome) #Outlier at the max
+quantile(hrdata$MonthlyIncome, prob = 0.99) #195370
+hrdata <- hrdata[hrdata$MonthlyIncome<=195370,]
+
+#Convert factor variables to numeric categories
+#Attrition: Yes = 1
+hrdata$Attrition[hrdata$Attrition=="Yes"]<-1
+hrdata$Attrition[hrdata$Attrition=="No"]<-0
+hrdata$Attrition <- as.numeric(as.character(hrdata$Attrition))
+#Business Travel: High frequency, higher number
+hrdata$BusinessTravel[hrdata$BusinessTravel=="Travel_Frequently"]<-2
+hrdata$BusinessTravel[hrdata$BusinessTravel=="Travel_Rarely"]<-1
+hrdata$BusinessTravel[hrdata$BusinessTravel=="Non-Travel"]<-0
+hrdata$BusinessTravel <- as.numeric(as.character(hrdata$BusinessTravel))
+#Job role: Assign 1-9 for the 9 job roles available
+list_of_JobRoles <- c("Human Resources","Laboratory Technician","Sales Representative", "Sales Executive","Healthcare Representative","Research Scientist","Research Director","Manufacturing Director","Manager")
+index_of_JobRoles <- c(1:9)
+for (i in index_of_JobRoles){
+  hrdata$JobRole[hrdata$JobRole==list_of_JobRoles[i]] <- i
+}
+hrdata$JobRole <- as.numeric(as.character(hrdata$JobRole))
+
+#Data visualisation: Correlation plots and distributions
+pdf("CorrelationPlot_HR.pdf")
+chart.Correlation(hrdata[,3:10], histogram=TRUE)
+dev.off()
+```
+
+Splitting into train and test sets
+```{r}
+#Splitting into train and test sets
+set.seed(1)
+train.size <-  nrow(hrdata)*0.7 #Training set to include 70% of the entries
+train <-  sample(1:nrow(hrdata), train.size)
+test <-  -train #Testing set to include 30% of the entries
+hrdata.train <-  hrdata[train, ]
+hrdata.test <-  hrdata[test, ]
+```
+
+
+Feature selection using various methods
+```{r}
+# Method 1: Standard logistic regression
+glm.fit <-  glm(Attrition ~ . - AgeGroup - JobRole, 
+              data = hrdata,
+              family = binomial,
+              subset = train) #Fitting the standard logistic regression model on training set
+glm.probs <-  predict(glm.fit, hrdata.test, type = "response") #Predicting probability of attrition based on predictor variables
+glm.pred <-  rep(0, length(glm.probs))
+glm.pred[glm.probs > 0.5] <- 1 #Assuming positive attrition for those with attrition probabilities greater than 0.5
+mean(glm.pred != hrdata.test$Attrition) #Mean error rate = 0.2316
+
+mod.glm_fit <-  glm(Attrition ~ . - AgeGroup - JobRole,
+              data = hrdata,
+              family = binomial) #Fitting the standard logistic regression model on entire dataset
+summary(mod.glm_fit) #summary table for logistic regression
+
+
+
+#Method 2: Logistic regression with stepAIC
+glm_AIC_fit <- glm(Attrition ~ . - AgeGroup - JobRole, data=hrdata.train, family=binomial) %>%
+  stepAIC(trace=FALSE, direction= "backward") #Fitting the logistic stepAIC regression model on training set
+glm_AIC_fit.probs <-  predict(glm_AIC_fit, hrdata.test, type = "response") #Predicting probability of attrition based on predictor variables
+glm_AIC_fit.pred <-  rep(0, length(glm_AIC_fit.probs))
+glm_AIC_fit.pred[glm_AIC_fit.probs > 0.5] <- 1 #Assuming positive attrition for those with attrition probabilities greater than 0.5
+mean(glm_AIC_fit.pred != hrdata.test$Attrition) #Mean error rate = 0.2316
+
+mod.glm_AIC_fit <- glm(Attrition ~ . - AgeGroup - JobRole, data=hrdata, family=binomial) %>%
+  stepAIC(trace=FALSE, direction= "backward") #Fitting the logistic stepAIC regression model on entire dataset
+summary(mod.glm_AIC_fit) #summary table for logistic regression with stepAIC
+
+
+
+
+#Create X matrix needed for glmnet regression
+train.mat <-  model.matrix(Attrition ~ . - AgeGroup - JobRole, data = hrdata.train)
+test.mat <-  model.matrix(Attrition ~ . - AgeGroup - JobRole, data = hrdata.test)
+grid <-  10 ^ seq(4, -2, length = 100)
+
+#Method 3: Ridge regression
+cv.ridge <-  cv.glmnet(train.mat, hrdata.train$Attrition, family = "binomial", alpha = 0, lambda = grid, thresh = 1e-12) #Cross validation to select optimal lambda
+lambda.best <-  cv.ridge$lambda.min #Selecting optimal lambda
+mod.ridge <-  glmnet(train.mat, hrdata.train$Attrition, family = "binomial", alpha = 0, lambda = lambda.best) #Fitting ridge regression model on training set based on optimal lambda
+ridge.probs <-  predict(mod.ridge, newx = test.mat, s = lambda.best, type = "response") #Predicting probability of attrition based on predictor variables
+ridge.pred <-  rep(0, length(ridge.probs))
+ridge.pred[ridge.probs > 0.5] <- 1 #Assuming positive attrition for those with attrition probabilities greater than 0.5
+mean(ridge.pred != hrdata.test$Attrition) #Mean error rate = 0.2379
+
+mod.ridge <-  glmnet(model.matrix(Attrition ~ . - AgeGroup - JobRole, data = hrdata), hrdata$Attrition, alpha = 0, lambda=lambda.best) #Fitting ridge regression model on entire dataset
+predict(mod.ridge, s = lambda.best, type = "coefficients") #Coefficients of ridge regression
+
+
+
+
+#Method 4: Lasso regression
+mod.lasso <-  cv.glmnet(train.mat, hrdata.train$Attrition, family = "binomial", alpha = 1, lambda = grid, thresh = 1e-12) #Cross validation to select optimal lambda
+lambda.best <-  mod.lasso$lambda.min #Selecting optimal lambda
+lasso.probs <-  predict(mod.lasso, newx = test.mat, s = lambda.best, type = "response") #Predicting probability of attrition based on predictor variables
+lasso.pred <-  rep(0, length(lasso.probs))
+lasso.pred[lasso.probs > 0.5] <- 1 #Assuming positive attrition for those with attrition probabilities greater than 0.5
+mean(lasso.pred != hrdata.test$Attrition) #Mean error rate = 0.2379
+
+mod.lasso <-  glmnet(model.matrix(Attrition ~ . - AgeGroup - JobRole, data = hrdata), hrdata$Attrition, alpha = 1, lambda=lambda.best) #Fitting lasso regression model on entire dataset
+predict(mod.lasso, s = lambda.best, type = "coefficients") #Coefficients of lasso regression
+
+```
+
+
+
+Logistic regression using STAN
+```{r}
+logistic_model <- list(y=hrdata$Attrition,
+                     N=nrow(hrdata),
+                     p=4,
+                     x1=hrdata$PercentSalaryHike,
+                     x2=hrdata$StockOptionLevel,
+                     x3=hrdata$YearsSinceLastPromotion,
+                     x4=hrdata$BusinessTravel)
+logistic_fit <- stan(file = 'hr_logistic.stan', data = logistic_model, init="random",chains=3,iter=3000, warmup = 1000, seed=1)
+
+
+#Print results
+traceplot(logistic_fit, pars = c("alpha","beta[1]","beta[2]","beta[3]","beta[4]"), inc_warmup = TRUE)
+print(logistic_fit, pars = c("alpha","beta"))
+print(logistic_fit, pars = c("AIC","BIC"))
+```
+
+
+
+Ridge regression using STAN
+```{r}
+ridge_model <- list(y=hrdata$Attrition,
+                     N=nrow(hrdata),
+                     p=4,
+                     x1=hrdata$PercentSalaryHike,
+                     x2=hrdata$StockOptionLevel,
+                     x3=hrdata$YearsSinceLastPromotion,
+                     x4=hrdata$BusinessTravel)
+ridge_fit <- stan(file = 'hr_ridge.stan', data = ridge_model, init="random",chains=3,iter=3000, warmup = 1000, seed=1)
+
+
+#Print results
+traceplot(ridge_fit, pars = c("alpha","beta[1]","beta[2]","beta[3]","beta[4]","lambda"), inc_warmup = TRUE)
+print(ridge_fit, pars = c("alpha","beta","lambda"))
+print(ridge_fit, pars = c("AIC","BIC"))
+
+```
+
+
+Lasso regression using STAN
+```{r}
+lasso_model <- list(y=hrdata$Attrition,
+                     N=nrow(hrdata),
+                     p=4,
+                     x1=hrdata$PercentSalaryHike,
+                     x2=hrdata$StockOptionLevel,
+                     x3=hrdata$YearsSinceLastPromotion,
+                     x4=hrdata$BusinessTravel)
+lasso_fit <- stan(file = 'hr_lasso.stan', data = lasso_model, init="random",chains=3,iter=3000, warmup = 1000, seed=1)
+
+
+#Print results
+traceplot(lasso_fit, pars = c("alpha","beta[1]","beta[2]","beta[3]","beta[4]","lambda"), inc_warmup = TRUE)
+print(lasso_fit, pars = c("alpha","beta","lambda"))
+print(lasso_fit, pars = c("AIC","BIC"))
+
+```
+
+
+Hierarchical model (Age Group) using STAN
+```{r}
+hierarchical_model <- list(y=hrdata$Attrition,
+                           N=nrow(hrdata),
+                           K=length(unique(hrdata$AgeGroup)),
+                           x=hrdata[,4:7],
+                           p=4,
+                           AgeGroup=hrdata$AgeGroup)
+hierarchical_fit <- stan(file = 'hr_hierarchical_w_age.stan', data = hierarchical_model, init="random",chains=3,iter=5000,warmup=3000,seed=1,control = list(adapt_delta = 0.90))
+
+
+#Print estimates
+print(hierarchical_fit,pars=c("mu_alpha","mu_beta","sigma_beta"))
+print(hierarchical_fit,pars=c("alpha"))
+print(hierarchical_fit,pars=c("beta"))
+print(hierarchical_fit, pars = c("AIC","BIC"))
+
+#Plot traceplots
+traceplot(hierarchical_fit, pars=c("mu_alpha","mu_beta[1]","mu_beta[2]","mu_beta[3]","mu_beta[4]"), inc_warmup = TRUE)
+traceplot(hierarchical_fit,pars=c("sigma_beta[1]","sigma_beta[2]","sigma_beta[3]","sigma_beta[4]"), inc_warmup = TRUE)
+
+#Plot intervals
+mcmc_intervals(hierarchical_fit, pars=c("mu_alpha","mu_beta[1]","mu_beta[2]","mu_beta[3]",
+                           "mu_beta[4]"), prob=0.95)
+mcmc_intervals(hierarchical_fit, pars=c("sigma_beta[1]","sigma_beta[2]",
+                           "sigma_beta[3]", "sigma_beta[4]"),
+                            prob=0.95)
+mcmc_intervals(hierarchical_fit, pars=c("alpha[1]","alpha[2]","alpha[3]",
+                                        "alpha[4]","alpha[5]","alpha[6]",
+                                        "alpha[7]", "alpha[8]","alpha[9]",
+                                        "alpha[10]", "alpha[11]"), prob=0.95)
+mcmc_intervals(hierarchical_fit, pars=c("beta[1,1]","beta[2,1]","beta[3,1]",
+                                        "beta[4,1]","beta[5,1]","beta[6,1]",
+                                        "beta[7,1]", "beta[8,1]","beta[9,1]",
+                                        "beta[10,1]", "beta[11,1]"), prob=0.95)
+mcmc_intervals(hierarchical_fit, pars=c("beta[1,2]", "beta[2,2]","beta[3,2]",
+                                        "beta[4,2]","beta[5,2]","beta[6,2]",
+                                        "beta[7,2]", "beta[8,2]","beta[9,2]",
+                                        "beta[10,2]", "beta[11,2]"), prob=0.95)
+mcmc_intervals(hierarchical_fit, pars=c("beta[1,3]", "beta[2,3]","beta[3,3]",
+                                        "beta[4,3]","beta[5,3]","beta[6,3]",
+                                        "beta[7,3]", "beta[8,3]","beta[9,3]",
+                                        "beta[10,3]", "beta[11,3]"), prob=0.95)
+mcmc_intervals(hierarchical_fit, pars=c("beta[1,4]", "beta[2,4]","beta[3,4]",
+                                        "beta[4,4]", "beta[5,4]","beta[6,4]",
+                                        "beta[7,4]", "beta[8,4]","beta[9,4]",
+                                        "beta[10,4]", "beta[11,4]"), prob=0.95)
+```
+
+Hierarchical model (Job Role) using STAN
+```{r}
+hierarchical_job_model <- list(y=hrdata$Attrition,
+                           N=nrow(hrdata),
+                           K=length(unique(hrdata$JobRole)),
+                           x=hrdata[,4:7],
+                           p=4,
+                           JobRole=hrdata$JobRole)
+hierarchical_job_fit <- stan(file = 'hr_hierarchical_w_job.stan', data = hierarchical_job_model, init="random",chains=3,iter=4000,warmup=2000,seed=1)
+
+
+#Print estimates
+print(hierarchical_job_fit,pars=c("mu_alpha","mu_beta","sigma_beta"))
+print(hierarchical_job_fit,pars=c("alpha"))
+print(hierarchical_job_fit,pars=c("beta"))
+print(hierarchical_job_fit, pars = c("AIC","BIC"))
+
+#Plot traceplots
+traceplot(hierarchical_job_fit, pars=c("mu_alpha","mu_beta[1]","mu_beta[2]","mu_beta[3]","mu_beta[4]"), inc_warmup = TRUE)
+traceplot(hierarchical_job_fit,pars=c("sigma_beta[1]","sigma_beta[2]","sigma_beta[3]","sigma_beta[4]"), inc_warmup = TRUE)
+
+#Plot intervals
+mcmc_intervals(hierarchical_job_fit, pars=c("mu_alpha","mu_beta[1]","mu_beta[2]","mu_beta[3]",
+                           "mu_beta[4]"), prob=0.95)
+mcmc_intervals(hierarchical_job_fit, pars=c("sigma_beta[1]","sigma_beta[2]",
+                           "sigma_beta[3]", "sigma_beta[4]"),
+                            prob=0.95)
+mcmc_intervals(hierarchical_job_fit, pars=c("alpha[1]","alpha[2]","alpha[3]",
+                                        "alpha[4]","alpha[5]","alpha[6]",
+                                        "alpha[7]", "alpha[8]","alpha[9]"
+                                        ), prob=0.95)
+mcmc_intervals(hierarchical_job_fit, pars=c("beta[1,1]","beta[2,1]","beta[3,1]",
+                                        "beta[4,1]","beta[5,1]","beta[6,1]",
+                                        "beta[7,1]", "beta[8,1]","beta[9,1]"),
+                                          prob=0.95)
+mcmc_intervals(hierarchical_job_fit, pars=c("beta[1,2]", "beta[2,2]","beta[3,2]",
+                                        "beta[4,2]","beta[5,2]","beta[6,2]",
+                                        "beta[7,2]", "beta[8,2]","beta[9,2]"),
+                                        prob=0.95)
+mcmc_intervals(hierarchical_job_fit, pars=c("beta[1,3]", "beta[2,3]","beta[3,3]",
+                                        "beta[4,3]","beta[5,3]","beta[6,3]",
+                                        "beta[7,3]", "beta[8,3]","beta[9,3]"),
+                                        prob=0.95)
+mcmc_intervals(hierarchical_job_fit, pars=c("beta[1,4]", "beta[2,4]","beta[3,4]",
+                                        "beta[4,4]", "beta[5,4]","beta[6,4]",
+                                        "beta[7,4]", "beta[8,4]","beta[9,4]"),
+                                        prob=0.95)
+
+```
+
+
+Visualising regression tables using stargazer package
+```{r}
+#Print table 1
+model <- c('','Standard','stepAIC','Ridge', 'Lasso')
+constant <- c("Constant","-2.32***","-2.37***","4.60×10-2","7.05×10-2")
+salary <- c("PercentSalaryHike", "0.0502**", "0.0500**","8.69×10-3","6.33×10-3")
+stock <- c("StockOptionLevel", "-0.163*", "-0.162*", "-2.76×10-2", "-1.79×10-2")
+promotion <- c("YearsSinceLastPromotion","-0.245***","-2.44***","-3.72×10-2","-2.87×10-2")
+travel <- c("BusinessTravel", "0.725***","0.723***","0.123","0.112")
+income <- c("MonthlyIncome", "4.19×10-7","-","4.06×10-8","-")
+training <- c("TrainingTimesLastYear", "-0.0164", "-", "-2.32×10-3", "-")
+distance <- c("DistanceFromHome", "-3.64×10-3", "-", "-6.22×10-4", "-")
+errorrate <- c("Mean error rate", "0.2316", "0.2316", "0.2379", "0.2379")
+
+table_1 <- rbind(model, constant, salary, stock, promotion, travel, income, training, distance, errorrate) #Combining results
+df_table_1 <- data.frame(table_1) #Convert to dataframe to visualise with stargazer
+stargazer(df_success_rate, summary=FALSE, rownames=FALSE, type = "html", title = "Table 3") #Using stargazer to produce RHTML code
+
+
+#Print table 2
+model <- c('','Standard','Ridge', 'Lasso', 'Hierarchical-AgeGroup', 'Hierarchical-JobRole')
+constant <- c("Constant","-2.37","-2.27","-2.31","-2.38","-2.50")
+salary <- c("PercentSalaryHike", "0.05", "0.05","0.05","0.04","0.05")
+stock <- c("StockOptionLevel", "-0.16", "-0.16", "-0.15", "-0.23","-0.17")
+promotion <- c("YearsSinceLastPromotion","-0.25","-0.23","-0.23","-0.38","-0.27")
+travel <- c("BusinessTravel", "0.72","0.65","0.68","1.11","0.78")
+lambda <- c("Lambda", "-","1.44","3.51","-","-")
+AIC <- c("AIC", "4541.10", "4515.67", "4524.04", "5173.41", "4927.89")
+BIC <- c("BIC", "4567.92", "4547.86", "4556.24", "5522.19", "5223.01")
+
+table_2 <- rbind(model, constant, salary, stock, promotion, travel, lambda, AIC, BIC) #Combining results
+df_table_2 <- data.frame(table_2) #Convert to dataframe to visualise with stargazer
+stargazer(df_table_2, summary=FALSE, rownames=FALSE, type = "html", title = "Table 3") #Using stargazer to produce RHTML code
+```
+
